@@ -1,0 +1,173 @@
+#define ENA1 3
+#define direction_br1 2
+#define direction_br2 4
+
+#define ENB1 5
+#define direction_fr1 7
+#define direction_fr2 8
+
+#define ENA2 6
+#define direction_bl1 10
+#define direction_bl2 11
+
+#define ENB2 9
+#define direction_fl1 12
+#define direction_fl2 13
+int speed = 150;
+
+void setup() {
+  pinMode(ENA1, OUTPUT);
+  pinMode(direction_fr1, OUTPUT);
+  pinMode(direction_fr2, OUTPUT);
+
+  pinMode(ENB1, OUTPUT);
+  pinMode(direction_fl1, OUTPUT);
+  pinMode(direction_fl2, OUTPUT);
+
+  pinMode(ENA2, OUTPUT);
+  pinMode(direction_br1, OUTPUT);
+  pinMode(direction_br2, OUTPUT);
+
+  pinMode(ENB2, OUTPUT);
+  pinMode(direction_bl1, OUTPUT);
+  pinMode(direction_bl2, OUTPUT);
+
+}
+
+void loop() {
+  forward();
+  delay(1000);
+  stop();
+  delay(1000);
+
+  backward();
+  delay(1000);
+  stop();
+  delay(1000);
+
+  right();
+  delay(1000);
+  stop();
+  delay(1000);
+
+  left();
+  delay(1000);
+  stop();
+  delay(1000);
+
+  cw();
+  delay(1000);
+  stop();
+  delay(1000);
+
+  ccw();
+  delay(1000);
+  stop();
+  delay(1000);
+}
+
+
+void forward() {
+  analogWrite(ENA1, speed);
+  analogWrite(ENB1, speed);
+  analogWrite(ENA2, speed);
+  analogWrite(ENB2, speed);
+  digitalWrite(direction_fr1, LOW);
+  digitalWrite(direction_fr2, HIGH);
+  digitalWrite(direction_fl1, LOW);
+  digitalWrite(direction_fl2, HIGH);
+  digitalWrite(direction_br1, LOW);
+  digitalWrite(direction_br2, HIGH);
+  digitalWrite(direction_bl1, LOW);
+  digitalWrite(direction_bl2, HIGH);
+}
+
+void backward() {
+  analogWrite(ENA1, speed);
+  analogWrite(ENB1, speed);
+  analogWrite(ENA2, speed);
+  analogWrite(ENB2, speed);
+  digitalWrite(direction_fr1, HIGH);
+  digitalWrite(direction_fr2, LOW);
+  digitalWrite(direction_fl1, HIGH);
+  digitalWrite(direction_fl2, LOW);
+  digitalWrite(direction_br1, HIGH);
+  digitalWrite(direction_br2, LOW);
+  digitalWrite(direction_bl1, HIGH);
+  digitalWrite(direction_bl2, LOW);
+}
+
+void left() {
+  analogWrite(ENA1, speed);
+  analogWrite(ENB1, speed);
+  analogWrite(ENA2, speed);
+  analogWrite(ENB2, speed);
+  digitalWrite(direction_fr1, HIGH);
+  digitalWrite(direction_fr2, LOW);
+  digitalWrite(direction_fl1, LOW);
+  digitalWrite(direction_fl2, HIGH);
+  digitalWrite(direction_br1, LOW);
+  digitalWrite(direction_br2, HIGH);
+  digitalWrite(direction_bl1, HIGH);
+  digitalWrite(direction_bl2, LOW);
+}
+
+void right() {
+  analogWrite(ENA1, speed);
+  analogWrite(ENB1, speed);
+  analogWrite(ENA2, speed);
+  analogWrite(ENB2, speed);
+  digitalWrite(direction_fr1, LOW);
+  digitalWrite(direction_fr2, HIGH);
+  digitalWrite(direction_fl1, HIGH);
+  digitalWrite(direction_fl2, LOW);
+  digitalWrite(direction_br1, HIGH);
+  digitalWrite(direction_br2, LOW);
+  digitalWrite(direction_bl1, LOW);
+  digitalWrite(direction_bl2, HIGH);
+}
+
+void cw() {
+  analogWrite(ENA1, speed);
+  analogWrite(ENB1, speed);
+  analogWrite(ENA2, speed);
+  analogWrite(ENB2, speed);
+  digitalWrite(direction_fr1, HIGH);
+  digitalWrite(direction_fr2, LOW);
+  digitalWrite(direction_fl1, LOW);
+  digitalWrite(direction_fl2, HIGH);
+  digitalWrite(direction_br1, HIGH);
+  digitalWrite(direction_br2, LOW);
+  digitalWrite(direction_bl1, LOW);
+  digitalWrite(direction_bl2, HIGH);
+}
+
+void ccw() {
+  analogWrite(ENA1, speed);
+  analogWrite(ENB1, speed);
+  analogWrite(ENA2, speed);
+  analogWrite(ENB2, speed);
+  digitalWrite(direction_fr1, LOW);
+  digitalWrite(direction_fr2, HIGH);
+  digitalWrite(direction_fl1, HIGH);
+  digitalWrite(direction_fl2, LOW);
+  digitalWrite(direction_br1, LOW);
+  digitalWrite(direction_br2, HIGH);
+  digitalWrite(direction_bl1, HIGH);
+  digitalWrite(direction_bl2, LOW);
+}
+
+void stop() {
+  analogWrite(ENA1, 0);
+  analogWrite(ENB1, 0);
+  analogWrite(ENA2, 0);
+  analogWrite(ENB2, 0);
+  digitalWrite(direction_fr1, LOW);
+  digitalWrite(direction_fr2, LOW);
+  digitalWrite(direction_fl1, LOW);
+  digitalWrite(direction_fl2, LOW);
+  digitalWrite(direction_br1, LOW);
+  digitalWrite(direction_br2, LOW);
+  digitalWrite(direction_bl1, LOW);
+  digitalWrite(direction_bl2, LOW);
+}
