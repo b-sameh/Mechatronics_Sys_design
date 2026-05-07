@@ -1,0 +1,112 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <ESP32Servo.h>
+
+// --- WiFi & HiveMQ ---
+const char* ssid = "Wokwi-GUEST";
+const char* password = ""; 
+const char* mqtt_server = "ab08b93ba41c424c9a36ad7495893579.s1.eu.hivemq.cloud";
+const char* mqtt_user   = "Mech.design.project";
+const char* mqtt_pass   = "Hussein2862004";
+const int   mqtt_port   = 8883;
+
+// Servo Pins
+const int servoPin1 = 18; 
+const int servoPin2 = 19;
+const int servoPin3 = 21;
+const int servoPin4 = 22; // Gripper Servo
+
+Servo servo1, servo2, servo3, servo4;
+
+WiFiClientSecure espClient;
+PubSubClient client(espClient);
+
+// --- Position Data (Updated to include 4th servo) ---
+struct JointAngles {
+  int s1; int s2; int s3; int s4;
+};
+
+// Positions defined with gripper state:
+// 0 = Open (Zero/Boxes), 45 = Closed (Grip)
+JointAngles posZero     = {80, 115, 70, 0};
+JointAngles posGripping = {103, 175, 36, 45};
+JointAngles posBox1     = {43, 6, 172, 0};
+JointAngles posBox2     = {72, 17, 159, 0};
+JointAngles posBox3     = {93, 42, 150, 0};
+
+void setup() {
+  Serial.begin(115200);
+  servo1.attach(servoPin1);
+  servo2.attach(servoPin2);
+  servo3.attach(servoPin3);
+  servo4.attach(servoPin4);
+
+  setup_wifi();
+  espClient.setInsecure(); 
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+  client.setKeepAlive(60); 
+}
+
+void setup_wifi() {
+  delay(10);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+}
+
+void moveArm(JointAngles pos) {
+  servo1.write(pos.s1);
+  servo2.write(pos.s2);
+  servo3.write(pos.s3);
+  servo4.write(pos.s4); // This handles the auto gripper movement
+  Serial.println("Arm & Gripper moved to preset");
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  String message;
+  for (int i = 0; i < length; i++) { message += (char)payload[i]; }
+  
+  String topicStr = String(topic);
+
+  // 1. MANUAL CONTROL
+  if (topicStr == "arm/servo1") { servo1.write(message.toInt()); }
+  if (topicStr == "arm/servo2") { servo2.write(message.toInt()); }
+  if (topicStr == "arm/servo3") { servo3.write(message.toInt()); }
+  if (topicStr == "arm/servo4") { servo4.write(message.toInt()); } // Manual Gripper
+
+  // 2. AUTOMATED POSITIONS
+  if (topicStr == "arm/pose") {
+    if (message == "zero")     moveArm(posZero);
+    if (message == "grip")     moveArm(posGripping);
+    if (message == "box1")     moveArm(posBox1);
+    if (message == "box2")     moveArm(posBox2);
+    if (message == "box3")     moveArm(posBox3);
+  }
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Connecting to HiveMQ...");
+    // Using a unique ID to avoid connection loops
+    if (client.connect("ESP32_Arm_Client_BolaV2", mqtt_user, mqtt_pass)) {
+      Serial.println("connected");
+      client.subscribe("arm/servo1");
+      client.subscribe("arm/servo2");
+      client.subscribe("arm/servo3");
+      client.subscribe("arm/servo4");
+      client.subscribe("arm/pose");
+    } else {
+      delay(5000);
+    }
+  }
+}
+
+void loop() {
+  if (!client.connected()) { reconnect(); }
+  client.loop();
+}
