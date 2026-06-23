@@ -1,0 +1,583 @@
+#include <Wire.h>
+#include "BluetoothSerial.h"
+#include <esp_now.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <math.h>
+#include <Arduino.h>
+
+// ================= I2C & HIWONDER CONFIG =================
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+#define I2C_ADDR                     0x34
+#define MOTOR_TYPE_ADDR              20
+#define MOTOR_ENCODER_POLARITY_ADDR  21
+#define MOTOR_FIXED_SPEED_ADDR       51
+#define MOTOR_ENCODER_TOTAL_ADDR     60
+
+int moveSpeed = 30;
+float movementFactor = 1;
+float Distance_1 = 480;
+float Distance_2 = 1170;
+float Distance_3 = 200;
+float Distance_4 = 2000;
+float Distance_5 = 450;
+float Distance_6 = 1500;
+float Distance_7 = 600;
+
+// ================= ODOMETRY CONFIG =================
+char currentCmd = 'S';
+
+const float DISTANCE_PER_TICK = (3.14159265 * 60.0) / 890;
+const float STRAFE_SLIP_FACTOR = 1.15;
+
+// ================= MPU6050 / YAW CONFIG =================
+// MPU6050 shares the same I2C bus as the Hiwonder board.
+// Wire it: VCC->3.3V, GND->GND, SDA->21, SCL->22, AD0->GND (gives addr 0x68).
+#define MPU_ADDR       0x68
+#define MPU_PWR_MGMT_1 0x6B
+#define MPU_GYRO_CONFIG 0x1B
+#define MPU_GYRO_ZOUT_H 0x47
+
+// ±250 dps full scale -> 131 LSB per deg/s
+const float GYRO_LSB_PER_DPS = 131.0;
+
+// If a commanded CCW turn makes 'yaw' go DOWN instead of UP, set this to -1.0.
+// (See the calibration note in setup / the chat message.)
+float GYRO_SIGN = 1.0;
+
+float gyroZbias = 0.0;             // deg/s, measured at startup while still
+float yaw = 0.0;                   // deg, integrated heading (CCW positive)
+unsigned long lastYawMicros = 0;   // for dt measurement
+
+// Heading the robot should hold while driving straight (set by each turn).
+float targetHeading = 0.0;
+
+// Heading-hold (straight-line correction) tuning
+const float HOLD_KP       = 2.0;   // correction strength per degree of error
+const int   HOLD_MAX_CORR = 15;    // max steering correction added to wheels
+
+// Turn controller tuning (PD)
+const float TURN_TOL_DEG = 1.5;    // stop window (degrees)
+const int   TURN_MAX_SPD = 100;     // max rotate speed (Hiwonder units)
+const int   TURN_MIN_SPD = 50;     // floor to overcome stiction (lowered for PD)
+const float TURN_KP      = 0.6;    // proportional gain
+const float TURN_KD      = 1.2;    // derivative gain: brakes using gyro rate
+const unsigned long TURN_TIMEOUT = 8000; // ms safety
+
+// ================= BLUETOOTH CONFIG =================
+BluetoothSerial SerialBT;
+
+// ================= ARM SERVO HOLD-CONTROL =================
+char activeArmCmd = '\0';
+unsigned long lastArmCmdSend = 0;
+const unsigned long ARM_CMD_REPEAT_MS = 80;
+
+// ================= ESP-NOW CONFIG =================
+// MAC of ARM ESP32
+uint8_t peerAddress[] = {0x3C, 0x8A, 0x1F, 0xAE, 0xD8 , 0x18};
+
+// IMPORTANT: set this to the same channel printed by ARM ESP32
+const uint8_t ESPNOW_CHANNEL = 6;
+
+typedef struct struct_message {
+  char text[32];
+} struct_message;
+
+struct_message sendData;
+struct_message receiveData;
+esp_now_peer_info_t peerInfo;
+
+// ================= SYSTEM VARIABLES =================
+bool autonomousMode = false;
+
+// ================= ESP-NOW FUNCTIONS =================
+void sendESPNow(const char* msg) {
+  memset(&sendData, 0, sizeof(sendData));
+  strncpy(sendData.text, msg, sizeof(sendData.text) - 1);
+
+  esp_err_t result = esp_now_send(peerAddress, (uint8_t *)&sendData, sizeof(sendData));
+
+  Serial.print("ESP-NOW queue result: ");
+  Serial.println(result == ESP_OK ? "Queued" : "Error");
+}
+
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.print("ESP-NOW delivery: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
+}
+
+void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
+  memset(&receiveData, 0, sizeof(receiveData));
+  memcpy(&receiveData, incomingData, min(len, (int)sizeof(receiveData)));
+
+  Serial.print(">> ESP-NOW Received: ");
+  Serial.println(receiveData.text);
+
+  String msg = String(receiveData.text);
+  msg.trim();
+  msg.toLowerCase();
+
+  if (msg == "ping") {
+    sendESPNow("pong");
+  }
+}
+
+// ================= HIWONDER I2C FUNCTIONS =================
+void writeReg(uint8_t reg, int8_t m1, int8_t m2, int8_t m3, int8_t m4) {
+  Wire.beginTransmission(I2C_ADDR);
+  Wire.write(reg);
+  Wire.write((uint8_t)m1);
+  Wire.write((uint8_t)m2);
+  Wire.write((uint8_t)m3);
+  Wire.write((uint8_t)m4);
+  Wire.endTransmission();
+}
+
+void readEncoders(int32_t *encs) {
+  Wire.beginTransmission(I2C_ADDR);
+  Wire.write(MOTOR_ENCODER_TOTAL_ADDR);
+  if (Wire.endTransmission(false) == 0) {
+    Wire.requestFrom(I2C_ADDR, 16);
+    for (int i = 0; i < 4; i++) {
+      if (Wire.available() >= 4) {
+        uint32_t b1 = Wire.read();
+        uint32_t b2 = Wire.read();
+        uint32_t b3 = Wire.read();
+        uint32_t b4 = Wire.read();
+        encs[i] = (int32_t)(b1 | (b2 << 8) | (b3 << 16) | (b4 << 24));
+      }
+    }
+  }
+}
+
+// ================= MPU6050 / YAW FUNCTIONS =================
+void mpuInit() {
+  // Wake the device (clear sleep bit)
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(MPU_PWR_MGMT_1);
+  Wire.write(0x00);
+  Wire.endTransmission();
+  delay(100);
+
+  // Gyro full scale = ±250 dps (0x00)
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(MPU_GYRO_CONFIG);
+  Wire.write(0x00);
+  Wire.endTransmission();
+  delay(10);
+}
+
+// Returns raw gyro-Z rate in deg/s (bias NOT removed here)
+float readGyroZ_dps() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(MPU_GYRO_ZOUT_H);
+  if (Wire.endTransmission(false) != 0) return 0.0;
+  Wire.requestFrom(MPU_ADDR, 2);
+  if (Wire.available() < 2) return 0.0;
+  uint8_t hi = Wire.read();
+  uint8_t lo = Wire.read();
+  int16_t raw = (int16_t)((hi << 8) | lo);
+  return (float)raw / GYRO_LSB_PER_DPS;
+}
+
+// Average many samples while the robot is perfectly still
+void calibrateGyro(int samples) {
+  double sum = 0.0;
+  for (int i = 0; i < samples; i++) {
+    sum += readGyroZ_dps();
+    delay(2);
+  }
+  gyroZbias = (float)(sum / samples);
+  Serial.print("Gyro-Z bias (dps): ");
+  Serial.println(gyroZbias, 4);
+}
+
+// Integrate the bias-corrected rate into 'yaw'. Call frequently while moving.
+void updateYaw() {
+  unsigned long now = micros();
+  float dt = (now - lastYawMicros) / 1000000.0;
+  lastYawMicros = now;
+  // Reject the first sample after a long pause (e.g. after delay(14000)).
+  if (dt <= 0.0 || dt > 0.5) return;
+  float rate = GYRO_SIGN * (readGyroZ_dps() - gyroZbias);
+  yaw += rate * dt;
+}
+
+// Wrap an angle to (-180, 180]
+float wrap180(float a) {
+  while (a > 180.0)  a -= 360.0;
+  while (a <= -180.0) a += 360.0;
+  return a;
+}
+
+// ================= KINEMATICS & MOTOR MIXING =================
+void driveRobot(int m1, int m2, int m3, int m4) {
+  m1 = constrain(m1, -100, 100);
+  m2 = constrain(m2, -100, 100);
+  m3 = constrain(m3, -100, 100);
+  m4 = constrain(m4, -100, 100);
+  writeReg(MOTOR_FIXED_SPEED_ADDR, m1, m2, m3, m4);
+}
+
+// ================= MOVEMENT WRAPPERS =================
+void forward()   { driveRobot(moveSpeed,  moveSpeed,  moveSpeed,  moveSpeed); }
+void backward()  { driveRobot(-moveSpeed, -moveSpeed, -moveSpeed, -moveSpeed); }
+void left()      { driveRobot(5, -5, -5,  5); }
+void right()     { driveRobot(-5,  5,  5, -5); }
+void diagFR()    { driveRobot(0,          5,  5,          0); }
+void diagFL()    { driveRobot(5,          0,          0,  5); }
+void diagBR()    { driveRobot(-5,         0,          0, -5); }
+void diagBL()    { driveRobot(0,         -5, -5,          0); }
+void CW()        { driveRobot(-moveSpeed, moveSpeed, -moveSpeed,  moveSpeed); }
+void CCW()       { driveRobot(moveSpeed, -moveSpeed,  moveSpeed, -moveSpeed); }
+void stopAll()   { driveRobot(0, 0, 0, 0); }
+
+// Speed-parametrized rotation (same mixing as CW()/CCW())
+// Convention: rotateCCW(+) should make 'yaw' INCREASE. If not, flip GYRO_SIGN.
+void rotateCW(int s)  { driveRobot(-s,  s, -s,  s); }
+void rotateCCW(int s) { driveRobot( s, -s,  s, -s); }
+
+void executeMovement(char cmd) {
+  switch (cmd) {
+    case 'F': forward(); break;
+    case 'B': backward(); break;
+    case 'L': left(); break;
+    case 'R': right(); break;
+    case 'Q': diagFL(); break;
+    case 'E': diagFR(); break;
+    case 'X': CW(); break;
+    case 'Y': CCW(); break;
+    case 'G': diagBL(); break;
+    case 'H': diagBR(); break;
+    case 'S':
+    default:
+      stopAll();
+      break;
+  }
+}
+
+// ================= CLOSED-LOOP ROTATION (YAW) — PD CONTROLLER =================
+// Rotate in place until heading == targetDeg (absolute, CCW positive).
+// PD law:  output = Kp*error - Kd*rate
+//   - error = targetDeg - yaw  (how far we still need to turn)
+//   - rate  = gyro Z spin speed (deg/s); d(error)/dt is exactly -rate, so the
+//     gyro gives a clean derivative for free. It brakes the rotation as the robot
+//     approaches the target, which kills the overshoot of the old P-only loop.
+void turnToHeading(float targetDeg) {
+  lastYawMicros = micros();          // reset dt so first sample is clean
+  unsigned long t0 = millis();
+  int settle = 0;
+
+  while (autonomousMode) {
+    updateYaw();
+    float err  = wrap180(targetDeg - yaw);
+    float rate = GYRO_SIGN * (readGyroZ_dps() - gyroZbias);  // current spin speed (deg/s)
+
+    if (fabs(err) < TURN_TOL_DEG) {
+      stopAll();
+      settle++;
+      if (settle > 10) break;        // held inside window ~50 ms -> done
+      delay(5);
+      continue;
+    }
+    settle = 0;
+
+    // PD: P pushes toward the target, D (gyro rate) brakes to prevent overshoot.
+    float output = TURN_KP * err - TURN_KD * rate;
+
+    int spd = (int)lround(fabs(output));
+    if (fabs(err) > TURN_TOL_DEG && spd < TURN_MIN_SPD) spd = TURN_MIN_SPD; // stiction floor
+    spd = constrain(spd, 0, TURN_MAX_SPD);
+
+    // Direction comes from the SIGN OF OUTPUT (not err) so the controller can
+    // actively brake in reverse when it is approaching the target too fast.
+    if (spd == 0)        stopAll();
+    else if (output > 0) rotateCCW(spd);
+    else                 rotateCW(spd);
+
+    if (millis() - t0 > TURN_TIMEOUT) {
+      Serial.println("Warning: turn timed out!");
+      break;
+    }
+
+    // allow manual abort
+    if (SerialBT.available()) {
+      char btCmd = SerialBT.read();
+      if (btCmd == 'M') {
+        autonomousMode = false;
+        currentCmd = 'S';
+        stopAll();
+        return;
+      }
+    }
+    delay(5);
+  }
+  stopAll();
+  delay(200);
+  targetHeading = targetDeg;   // straight moves will hold this heading
+}
+void turnBy(float deltaDeg) {
+  turnToHeading(yaw + deltaDeg);
+}
+
+// ================= TRANSLATION WITH HEADING HOLD =================
+// Drives a straight move (F/B/L/R) while correcting any yaw drift back to
+// targetHeading, so the robot keeps a constant heading inside the track lane.
+void driveTranslationWithHeadingHold(char cmd) {
+  int b1 = 0, b2 = 0, b3 = 0, b4 = 0;
+  switch (cmd) {
+    case 'F': b1 =  moveSpeed; b2 =  moveSpeed; b3 =  moveSpeed; b4 =  moveSpeed; break;
+    case 'B': b1 = -moveSpeed; b2 = -moveSpeed; b3 = -moveSpeed; b4 = -moveSpeed; break;
+    case 'R': b1 = -moveSpeed; b2 =  moveSpeed; b3 =  moveSpeed; b4 = -moveSpeed; break;
+    case 'L': b1 =  moveSpeed; b2 = -moveSpeed; b3 = -moveSpeed; b4 =  moveSpeed; break;
+    default: stopAll(); return;
+  }
+
+  // Steering correction: same wheel pattern as rotateCCW (+,-,+,-) increases yaw.
+  float err = wrap180(targetHeading - yaw);
+  int c = (int)(HOLD_KP * err);
+  c = constrain(c, -HOLD_MAX_CORR, HOLD_MAX_CORR);
+
+  driveRobot(b1 + c, b2 - c, b3 + c, b4 - c);
+}
+
+// ================= PRECISION EXACT DISTANCE MOVEMENT =================
+void moveExactDistance(char cmd, float target_distance_mm) {
+  int32_t start_enc[4];
+  readEncoders(start_enc);
+
+  float traveled_distance = 0.0;
+  unsigned long startTimeout = millis();
+  lastYawMicros = micros();          // keep yaw integration continuous
+
+  while (autonomousMode) {
+    updateYaw();                      // track heading drift during translation
+
+    int32_t current_enc[4];
+    readEncoders(current_enc);
+
+    float d1 = (current_enc[0] - start_enc[0]) * DISTANCE_PER_TICK;
+    float d2 = (current_enc[1] - start_enc[1]) * DISTANCE_PER_TICK;
+    float d3 = (current_enc[2] - start_enc[2]) * DISTANCE_PER_TICK;
+    float d4 = (current_enc[3] - start_enc[3]) * DISTANCE_PER_TICK;
+
+    float dX = (d1 + d2 + d3 + d4) / 4.0;
+    float dY = ((d1 - d2 - d3 + d4) / 4.0) * STRAFE_SLIP_FACTOR;
+
+    traveled_distance = sqrt((dX * dX) + (dY * dY));
+
+    if (traveled_distance >= target_distance_mm) {
+      break;
+    }
+
+    driveTranslationWithHeadingHold(cmd);
+
+    if (millis() - startTimeout > 30000) {
+      Serial.println("Warning: Target execution timed out!");
+      break;
+    }
+
+    if (SerialBT.available()) {
+      char btCmd = SerialBT.read();
+      if (btCmd == 'M') {
+        autonomousMode = false;
+        currentCmd = 'S';
+        stopAll();
+        return;
+      }
+    }
+
+    delay(5);
+  }
+
+  stopAll();
+  delay(300);
+}
+
+// ================= AUTONOMOUS ROUTINE =================
+// Sequence:
+//   1) forward a fed distance
+//   2) rotate 90 deg
+//   3) forward a fed distance
+//   4) strafe in Y (mecanum) a fed distance
+//   5) rotate 180 deg
+void autonomousRoutine() {
+  // Define "now" as heading 0. (Bias already measured in setup.)
+  yaw = 0.0;
+  targetHeading = 0.0;
+  lastYawMicros = micros();
+
+  // ---- 1) forward ----
+  moveExactDistance('F', movementFactor * Distance_1);
+  if (!autonomousMode) return;
+  
+
+  // ---- 2) rotate 90 deg ----
+  // +90 = CCW. For a clockwise 90, use turnToHeading(-90.0).
+  turnToHeading(90.0);
+  if (!autonomousMode) return;
+
+  // ---- 3) forward ----
+  moveExactDistance('F', movementFactor * Distance_2);
+  if (!autonomousMode) return;
+  sendESPNow("ready1");
+  SerialBT.println("ESP-NOW 'ready1' sent!");
+  delay(28000);
+
+  moveExactDistance('B', movementFactor * Distance_3);
+  if (!autonomousMode) return;
+  delay(500);
+
+  moveExactDistance('R', movementFactor * Distance_4);
+  if (!autonomousMode) return;
+  sendESPNow("ready2");
+  SerialBT.println("ESP-NOW 'ready2' sent!");
+  delay(25000);
+
+   moveExactDistance('L', movementFactor * Distance_5);
+  if (!autonomousMode) return;
+  delay(500);
+
+ 
+  turnBy(180.0);
+  delay(500);
+
+
+  moveExactDistance('F', movementFactor * Distance_6);
+  if (!autonomousMode) return;
+  delay(500);
+
+
+  moveExactDistance('diagFR', movementFactor * Distance_7);
+  if (!autonomousMode) return;
+  sendESPNow("ready3");
+  SerialBT.println("ESP-NOW 'ready3' sent!");
+  delay(25000);
+
+  autonomousMode = false;
+  currentCmd = 'S';
+  stopAll();
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  Serial.setTimeout(50);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  delay(500);
+
+  SerialBT.begin("Sina_Cola");
+  Serial.println("Bluetooth Started. Waiting for connections...");
+
+  WiFi.mode(WIFI_STA);
+
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+
+  Serial.print("This board MAC: ");
+  Serial.println(WiFi.macAddress());
+  Serial.print("ESP-NOW channel: ");
+  Serial.println(ESPNOW_CHANNEL);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+
+  esp_now_register_send_cb(OnDataSent);
+  esp_now_register_recv_cb(OnDataRecv);
+
+  memset(&peerInfo, 0, sizeof(peerInfo));
+  memcpy(peerInfo.peer_addr, peerAddress, 6);
+  peerInfo.channel = ESPNOW_CHANNEL;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add ESP-NOW peer");
+    return;
+  }
+
+  // Hiwonder motor type + encoder polarity
+  Wire.beginTransmission(I2C_ADDR);
+  Wire.write(MOTOR_TYPE_ADDR);
+  Wire.write(3); Wire.write(3); Wire.write(3); Wire.write(3);
+  Wire.endTransmission();
+  delay(50);
+
+  Wire.beginTransmission(I2C_ADDR);
+  Wire.write(MOTOR_ENCODER_POLARITY_ADDR);
+  Wire.write(0); Wire.write(0); Wire.write(0); Wire.write(0);
+  Wire.endTransmission();
+
+  stopAll();
+
+  // ---- MPU6050 init + gyro bias calibration ----
+  // The robot MUST be completely still here. Do not touch it.
+  mpuInit();
+  Serial.println("Calibrating gyro... keep the robot perfectly still.");
+  calibrateGyro(1000);
+  lastYawMicros = micros();
+  yaw = 0.0;
+
+  Serial.println("System Ready. Bluetooth & ESP-NOW Active (Two-Way Mode).");
+  Serial.println("Type in Serial Monitor to send ESP-NOW text to ARM ESP32.");
+}
+
+// ================= LOOP =================
+void loop() {
+  if (SerialBT.available()) {
+    char cmd = SerialBT.read();
+
+    if (cmd == 'C' || cmd == 'D' || cmd == 'J' || cmd == 'K' ||
+        cmd == 'N' || cmd == 'O' || cmd == 'P' || cmd == 'T') {
+      activeArmCmd = cmd;
+      char msg[2] = {cmd, '\0'};
+      sendESPNow(msg);
+      lastArmCmdSend = millis();
+    }
+    else if (cmd == 'S') {
+      activeArmCmd = '\0';
+      currentCmd = 'S';
+      stopAll();
+    }
+    else if (cmd == 'A') {
+      autonomousMode = true;
+      stopAll();
+    }
+    else if (cmd == 'M') {
+      autonomousMode = false;
+      activeArmCmd = '\0';
+      currentCmd = 'S';
+      stopAll();
+    }
+    else if (!autonomousMode) {
+      currentCmd = cmd;
+    }
+  }
+
+  if (activeArmCmd != '\0' && millis() - lastArmCmdSend >= ARM_CMD_REPEAT_MS) {
+    char msg[2] = {activeArmCmd, '\0'};
+    sendESPNow(msg);
+    lastArmCmdSend = millis();
+  }
+
+  if (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    if (input.length() > 0) {
+      sendESPNow(input.c_str());
+    }
+  }
+
+  if (!autonomousMode) {
+    executeMovement(currentCmd);
+  } else {
+    autonomousRoutine();
+  }
+
+  delay(5);
+}
